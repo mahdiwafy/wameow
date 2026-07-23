@@ -761,6 +761,13 @@ func handleSendMedia(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf(`{"error":"send: %s"}`, err.Error()), 500)
 		return
 	}
+
+	ownJID := ""
+	if cli.Store.ID != nil {
+		ownJID = cli.Store.ID.User
+	}
+	saveMessage(req.Session, sendResp.ID, jid.String(), ownJID, "Me", true, sendResp.Timestamp.Unix(), req.Caption, mime, true)
+
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"id":        sendResp.ID,
 		"timestamp": sendResp.Timestamp.Unix(),
