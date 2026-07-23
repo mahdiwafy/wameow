@@ -77,9 +77,13 @@ func initMsgDB() {
 	} else {
 		log.Println("wameow: permanent message archive DB initialized")
 	}
+	// Add optional columns for existing databases (ignore errors if already exist)
+	msgDB.Exec(`ALTER TABLE messages ADD COLUMN file_name TEXT`)
+	msgDB.Exec(`ALTER TABLE messages ADD COLUMN file_size INTEGER`)
+	msgDB.Exec(`ALTER TABLE messages ADD COLUMN local_path TEXT`)
 }
 
-func saveMessage(session string, id string, chatId string, sender string, pushName string, fromMe bool, timestamp int64, body string, msgType string, hasMedia bool) {
+func saveMessage(session string, id string, chatId string, sender string, pushName string, fromMe bool, timestamp int64, body string, msgType string, hasMedia bool, extra ...map[string]interface{}) {
 	if msgDB == nil || id == "" {
 		return
 	}
@@ -94,13 +98,32 @@ func saveMessage(session string, id string, chatId string, sender string, pushNa
 	if msgType == "" {
 		msgType = "text"
 	}
+
+	fileName := ""
+	fileSize := int64(0)
+	localPath := ""
+	if len(extra) > 0 {
+		if v, ok := extra[0]["fileName"]; ok {
+			fileName, _ = v.(string)
+		}
+		if v, ok := extra[0]["fileSize"]; ok {
+			fileSize, _ = v.(int64)
+		}
+		if v, ok := extra[0]["localPath"]; ok {
+			localPath, _ = v.(string)
+		}
+	}
+
 	_, _ = msgDB.Exec(`
-		INSERT INTO messages (id, session, chat_id, sender, sender_name, from_me, timestamp, body, msg_type, has_media)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO messages (id, session, chat_id, sender, sender_name, from_me, timestamp, body, msg_type, has_media, file_name, file_size, local_path)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			body=excluded.body,
-			sender_name=COALESCE(NULLIF(excluded.sender_name, ''), messages.sender_name)
-	`, id, session, chatId, sender, pushName, fm, timestamp, body, msgType, hm)
+			sender_name=COALESCE(NULLIF(excluded.sender_name, ''), messages.sender_name),
+			file_name=COALESCE(NULLIF(excluded.file_name, ''), messages.file_name),
+			file_size=COALESCE(NULLIF(excluded.file_size, 0), messages.file_size),
+			local_path=COALESCE(NULLIF(excluded.local_path, ''), messages.local_path)
+	`, id, session, chatId, sender, pushName, fm, timestamp, body, msgType, hm, fileName, fileSize, localPath)
 }
 
 func main() {
@@ -335,16 +358,19 @@ func handlerFor(session string, cli *whatsmeow.Client) whatsmeow.EventHandler {
 				payload["body"] = doc.GetCaption()
 				payload["hasMedia"] = true
 				payload["type"] = "document"
+				docName := doc.GetFileName()
+				if docName == "" {
+					docName = fmt.Sprintf("doc_%s", info.ID)
+				}
+				payload["fileName"] = docName
 				if data, err := cli.Download(ctx, doc); err == nil {
 					os.MkdirAll("/home/mahdiwafy/.hermes/cache/documents", 0755)
-					filename := doc.GetFileName()
-					if filename == "" {
-						filename = fmt.Sprintf("doc_%s.docx", info.ID)
-					}
-					savePath := fmt.Sprintf("/home/mahdiwafy/.hermes/cache/documents/%s_%s", info.ID, filename)
+					savePath := fmt.Sprintf("/home/mahdiwafy/.hermes/cache/documents/%s_%s", info.ID, docName)
 					if err := os.WriteFile(savePath, data, 0644); err == nil {
 						log.Printf("wameow: saved document to %s", savePath)
 						payload["body"] = fmt.Sprintf("[Document saved: %s]", savePath)
+						payload["localPath"] = savePath
+						payload["fileSize"] = len(data)
 					}
 				} else {
 					log.Printf("wameow: doc download failed msg_id=%s err=%v", info.ID, err)
@@ -364,7 +390,17 @@ func handlerFor(session string, cli *whatsmeow.Client) whatsmeow.EventHandler {
 			if hm, ok := payload["hasMedia"].(bool); ok {
 				hasMediaBool = hm
 			}
-			saveMessage(session, info.ID, info.Chat.String(), sender, info.PushName, false, info.Timestamp.Unix(), bodyStr, msgTypeStr, hasMediaBool)
+			extraMap := map[string]interface{}{}
+			if fn, ok := payload["fileName"].(string); ok {
+				extraMap["fileName"] = fn
+			}
+			if lp, ok := payload["localPath"].(string); ok {
+				extraMap["localPath"] = lp
+			}
+			if fs, ok := payload["fileSize"].(int); ok {
+				extraMap["fileSize"] = int64(fs)
+			}
+			saveMessage(session, info.ID, info.Chat.String(), sender, info.PushName, false, info.Timestamp.Unix(), bodyStr, msgTypeStr, hasMediaBool, extraMap)
 
 			go forwardWebhook(session, payload)
 
@@ -782,7 +818,14 @@ func handleSendMedia(w http.ResponseWriter, r *http.Request) {
 	if cli.Store.ID != nil {
 		ownJID = cli.Store.ID.User
 	}
-	saveMessage(req.Session, sendResp.ID, jid.String(), ownJID, "Me", true, sendResp.Timestamp.Unix(), req.Caption, mime, true)
+	extraMap := map[string]interface{}{
+		"fileName": req.FileName,
+		"fileSize": int64(len(data)),
+	}
+	if req.FilePath != "" {
+		extraMap["localPath"] = req.FilePath
+	}
+	saveMessage(req.Session, sendResp.ID, jid.String(), ownJID, "Me", true, sendResp.Timestamp.Unix(), req.Caption, mime, true, extraMap)
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"id":        sendResp.ID,
@@ -1327,7 +1370,8 @@ func handleHistoryMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := msgDB.Query(`
-		SELECT id, session, chat_id, sender, sender_name, from_me, timestamp, body, msg_type, has_media
+		SELECT id, session, chat_id, sender, sender_name, from_me, timestamp, body, msg_type, has_media,
+		       COALESCE(file_name,''), COALESCE(file_size,0), COALESCE(local_path,'')
 		FROM messages
 		WHERE session=? AND chat_id=?
 		ORDER BY timestamp DESC
@@ -1341,12 +1385,13 @@ func handleHistoryMessages(w http.ResponseWriter, r *http.Request) {
 
 	var msgs []map[string]interface{}
 	for rows.Next() {
-		var id, sess, cID, sender, senderName, body, msgType string
+		var id, sess, cID, sender, senderName, body, msgType, fileName, localPath string
 		var fromMe, timestamp, hasMedia int
-		if err := rows.Scan(&id, &sess, &cID, &sender, &senderName, &fromMe, &timestamp, &body, &msgType, &hasMedia); err != nil {
+		var fileSize int64
+		if err := rows.Scan(&id, &sess, &cID, &sender, &senderName, &fromMe, &timestamp, &body, &msgType, &hasMedia, &fileName, &fileSize, &localPath); err != nil {
 			continue
 		}
-		msgs = append(msgs, map[string]interface{}{
+		row := map[string]interface{}{
 			"id":         id,
 			"session":    sess,
 			"chatId":     cID,
@@ -1357,7 +1402,17 @@ func handleHistoryMessages(w http.ResponseWriter, r *http.Request) {
 			"body":       body,
 			"type":       msgType,
 			"hasMedia":   hasMedia == 1,
-		})
+		}
+		if fileName != "" {
+			row["fileName"] = fileName
+		}
+		if fileSize > 0 {
+			row["fileSize"] = fileSize
+		}
+		if localPath != "" {
+			row["localPath"] = localPath
+		}
+		msgs = append(msgs, row)
 	}
 	if msgs == nil {
 		msgs = []map[string]interface{}{}
@@ -1422,7 +1477,8 @@ func handleHistorySearch(w http.ResponseWriter, r *http.Request) {
 
 	likePattern := "%" + q + "%"
 	querySQL := `
-		SELECT id, session, chat_id, sender, sender_name, from_me, timestamp, body, msg_type, has_media
+		SELECT id, session, chat_id, sender, sender_name, from_me, timestamp, body, msg_type, has_media,
+		       COALESCE(file_name,''), COALESCE(file_size,0), COALESCE(local_path,'')
 		FROM messages
 		WHERE (body LIKE ? OR sender_name LIKE ? OR sender LIKE ? OR chat_id LIKE ?)
 	`
@@ -1443,12 +1499,13 @@ func handleHistorySearch(w http.ResponseWriter, r *http.Request) {
 
 	var msgs []map[string]interface{}
 	for rows.Next() {
-		var id, sess, cID, sender, senderName, body, msgType string
+		var id, sess, cID, sender, senderName, body, msgType, fileName, localPath string
 		var fromMe, timestamp, hasMedia int
-		if err := rows.Scan(&id, &sess, &cID, &sender, &senderName, &fromMe, &timestamp, &body, &msgType, &hasMedia); err != nil {
+		var fileSize int64
+		if err := rows.Scan(&id, &sess, &cID, &sender, &senderName, &fromMe, &timestamp, &body, &msgType, &hasMedia, &fileName, &fileSize, &localPath); err != nil {
 			continue
 		}
-		msgs = append(msgs, map[string]interface{}{
+		row := map[string]interface{}{
 			"id":         id,
 			"session":    sess,
 			"chatId":     cID,
@@ -1459,7 +1516,17 @@ func handleHistorySearch(w http.ResponseWriter, r *http.Request) {
 			"body":       body,
 			"type":       msgType,
 			"hasMedia":   hasMedia == 1,
-		})
+		}
+		if fileName != "" {
+			row["fileName"] = fileName
+		}
+		if fileSize > 0 {
+			row["fileSize"] = fileSize
+		}
+		if localPath != "" {
+			row["localPath"] = localPath
+		}
+		msgs = append(msgs, row)
 	}
 	if msgs == nil {
 		msgs = []map[string]interface{}{}
