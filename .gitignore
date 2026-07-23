@@ -1,0 +1,19 @@
+# Binaries
+wameow
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Database & Storage
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.bak*
+
+# OS & IDE
+.DS_Store
+.vscode/
+.idea/

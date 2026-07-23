@@ -1,0 +1,30 @@
+[Unit]
+Description=Wameow — WhatsApp bridge (whatsmeow, 3 sessions)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mahdiwafy
+WorkingDirectory=/home/mahdiwafy/wameow
+ExecStart=/home/mahdiwafy/wameow/wameow \
+  --sessions=wa1,wa2,wa3 \
+  --jids=6285156487274,6285111041956,6281807177704 \
+  --webhook=http://localhost:8090/api/waha/webhook \
+  --listen=:52135 \
+  --ping-group=120363426307758670@g.us
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wameow
+Environment=GOMEMLIMIT=128MiB
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/mahdiwafy/wameow
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+
+[Install]
+WantedBy=multi-user.target
