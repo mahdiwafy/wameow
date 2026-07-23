@@ -335,6 +335,20 @@ func handlerFor(session string, cli *whatsmeow.Client) whatsmeow.EventHandler {
 				payload["body"] = doc.GetCaption()
 				payload["hasMedia"] = true
 				payload["type"] = "document"
+				if data, err := cli.Download(ctx, doc); err == nil {
+					os.MkdirAll("/home/mahdiwafy/.hermes/cache/documents", 0755)
+					filename := doc.GetFileName()
+					if filename == "" {
+						filename = fmt.Sprintf("doc_%s.docx", info.ID)
+					}
+					savePath := fmt.Sprintf("/home/mahdiwafy/.hermes/cache/documents/%s_%s", info.ID, filename)
+					if err := os.WriteFile(savePath, data, 0644); err == nil {
+						log.Printf("wameow: saved document to %s", savePath)
+						payload["body"] = fmt.Sprintf("[Document saved: %s]", savePath)
+					}
+				} else {
+					log.Printf("wameow: doc download failed msg_id=%s err=%v", info.ID, err)
+				}
 			}
 
 			// Archive incoming message to SQLite
@@ -467,7 +481,8 @@ func forwardWebhook(session string, payload map[string]interface{}) {
 // sendWithHumanPresence strictly enforces realistic human typing speed (30 WPM to 50 WPM, i.e., 240ms-400ms per character),
 // read receipts, and continuous interactive typing presence refreshment until the message is completely typed and sent.
 func sendWithHumanPresence(ctx context.Context, cli *whatsmeow.Client, jid types.JID, msg *proto.Message, textLen int, replyMsgID ...types.MessageID) (whatsmeow.SendResponse, error) {
-	// 1. Online Presence
+	// 1. Subscribe & Online Presence (Must subscribe to peer presence so WhatsApp server broadcasts typing status)
+	_ = cli.SubscribePresence(ctx, jid)
 	_ = cli.SendPresence(ctx, types.PresenceAvailable)
 	time.Sleep(time.Duration(300+rand.Intn(400)) * time.Millisecond)
 
@@ -480,23 +495,24 @@ func sendWithHumanPresence(ctx context.Context, cli *whatsmeow.Client, jid types
 	// 3. Calculate Realistic Human Typing Duration based on 30 WPM - 50 WPM:
 	// 50 WPM = 240ms/char (fastest human speed)
 	// 30 WPM = 400ms/char (relaxed human speed)
-	// Average per-character delay: 240ms + rand(120ms) -> 240ms..360ms
 	charMs := 240 + rand.Intn(120)
 	totalTypingMs := textLen * charMs
-	if totalTypingMs < 1200 { // minimum typing duration for very short text/media
-		totalTypingMs = 1200 + rand.Intn(600)
+	if totalTypingMs < 1500 { // minimum typing duration for very short text/media (1.5s - 2.2s)
+		totalTypingMs = 1500 + rand.Intn(700)
 	}
 
 	// 4. Interactive Typing Simulation: Keep "composing" status alive on WhatsApp servers
-	// Refresh ChatPresenceComposing every 4 seconds if typing takes a long time
-	log.Printf("TYPING SIMULATION: %d chars @ ~%dms/char -> total duration %dms", textLen, charMs, totalTypingMs)
+	// Refresh ChatPresenceComposing every 1.5s so typing bubble never disappears/expires on recipient screen
+	log.Printf("TYPING SIMULATION: peer=%s %d chars @ ~%dms/char -> total duration %dms", jid.String(), textLen, charMs, totalTypingMs)
 	
 	elapsed := 0
 	for elapsed < totalTypingMs {
-		_ = cli.SendChatPresence(ctx, jid, types.ChatPresenceComposing, types.ChatPresenceMediaText)
+		if err := cli.SendChatPresence(ctx, jid, types.ChatPresenceComposing, types.ChatPresenceMediaText); err != nil {
+			log.Printf("SendChatPresence error for %s: %v", jid.String(), err)
+		}
 		
-		// Chunk duration (max 4000ms per loop iteration)
-		chunk := 4000
+		// Refresh every 1.5s (1500ms) to ensure continuous "typing..." bubble on receiver screen
+		chunk := 1500
 		if totalTypingMs-elapsed < chunk {
 			chunk = totalTypingMs - elapsed
 		}
@@ -504,9 +520,9 @@ func sendWithHumanPresence(ctx context.Context, cli *whatsmeow.Client, jid types
 		elapsed += chunk
 	}
 
-	// 5. Brief pause before hit send (150ms-350ms) + Clear Composing State
+	// 5. Brief pause before hit send (200ms-400ms) + Clear Composing State
 	_ = cli.SendChatPresence(ctx, jid, types.ChatPresencePaused, types.ChatPresenceMediaText)
-	time.Sleep(time.Duration(150+rand.Intn(200)) * time.Millisecond)
+	time.Sleep(time.Duration(200+rand.Intn(200)) * time.Millisecond)
 
 	// 6. Send the actual message
 	return cli.SendMessage(ctx, jid, msg)
