@@ -236,6 +236,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/send", handleSend)
+	mux.HandleFunc("/send-async", handleSendAsync)
 	mux.HandleFunc("/typing", handleTyping)
 	mux.HandleFunc("/send-media", handleSendMedia)
 	mux.HandleFunc("/edit", handleEdit)
@@ -826,11 +827,70 @@ func handleSendMedia(w http.ResponseWriter, r *http.Request) {
 		extraMap["localPath"] = req.FilePath
 	}
 	saveMessage(req.Session, sendResp.ID, jid.String(), ownJID, "Me", true, sendResp.Timestamp.Unix(), req.Caption, mime, true, extraMap)
-
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"id":        sendResp.ID,
 		"timestamp": sendResp.Timestamp.Unix(),
 	})
+}
+
+func handleSendAsync(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "POST only", 405)
+		return
+	}
+	var req struct {
+		Session    string `json:"session"`
+		ChatID     string `json:"chatId"`
+		Text       string `json:"text"`
+		ReplyMsgID string `json:"replyMsgId,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	cli, ok := clients[req.Session]
+	if !ok {
+		http.Error(w, `{"error":"session not found"}`, 404)
+		return
+	}
+	if !cli.IsConnected() {
+		http.Error(w, `{"error":"not connected"}`, 503)
+		return
+	}
+	jid, err := resolveJID(cli, req.ChatID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"resolve: %s"}`, err.Error()), 400)
+		return
+	}
+
+	// Respond immediately so client never timeouts — send runs in background
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(202)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "queued",
+		"message": "send initiated in background with human presence simulation",
+	})
+
+	// Background send
+	go func() {
+		msg := &proto.Message{Conversation: &req.Text}
+		var replyIDs []types.MessageID
+		if req.ReplyMsgID != "" {
+			replyIDs = append(replyIDs, types.MessageID(req.ReplyMsgID))
+		}
+		resp, err := sendWithHumanPresence(context.Background(), cli, jid, msg, len(req.Text), replyIDs...)
+		if err != nil {
+			log.Printf("send (async) %s->%s FAIL: %v", req.Session, jid.String(), err)
+			return
+		}
+		ownJID := ""
+		if cli.Store.ID != nil {
+			ownJID = cli.Store.ID.User
+		}
+		saveMessage(req.Session, resp.ID, jid.String(), ownJID, "Me", true, resp.Timestamp.Unix(), req.Text, "text", false)
+		log.Printf("send (async) %s->%s OK: id=%s ts=%d", req.Session, jid.String(), resp.ID, resp.Timestamp.Unix())
+	}()
 }
 
 func handleEdit(w http.ResponseWriter, r *http.Request) {
