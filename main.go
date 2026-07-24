@@ -46,7 +46,31 @@ var (
 	qrActive  = map[string]bool{}
 
 	msgDB *sql.DB
+
+	// sendActivityMu/sendActivity track recent send timestamps per session in a
+	// trailing 60s window, used to adapt typing speed to task intensity.
+	sendActivityMu sync.Mutex
+	sendActivity   = map[string][]time.Time{}
 )
+
+// recordAndGetIntensity registers a send attempt for `session` and returns
+// how many sends that session has made in the trailing 60s window.
+func recordAndGetIntensity(session string) int {
+	sendActivityMu.Lock()
+	defer sendActivityMu.Unlock()
+	now := time.Now()
+	cutoff := now.Add(-60 * time.Second)
+	times := sendActivity[session]
+	kept := times[:0]
+	for _, t := range times {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	kept = append(kept, now)
+	sendActivity[session] = kept
+	return len(kept)
+}
 
 func initMsgDB() {
 	var err error
@@ -515,39 +539,91 @@ func forwardWebhook(session string, payload map[string]interface{}) {
 	resp.Body.Close()
 }
 
-// sendWithHumanPresence strictly enforces realistic human typing speed (30 WPM to 50 WPM, i.e., 240ms-400ms per character),
-// read receipts, and continuous interactive typing presence refreshment until the message is completely typed and sent.
-func sendWithHumanPresence(ctx context.Context, cli *whatsmeow.Client, jid types.JID, msg *proto.Message, textLen int, replyMsgID ...types.MessageID) (whatsmeow.SendResponse, error) {
+// speedTierFor maps a session's recent send intensity (sends in trailing 60s)
+// to a typing-speed tier. Idea: a single/occasional send looks exactly like a
+// human pasting a link or a prepared reply — that's fast AND normal, no bot
+// signal there. A burst of sends back-to-back is the actual bot-like pattern,
+// so that's when we deliberately slow down and add more human "thinking" jitter.
+//
+//	tier 0 (casual, <=2 sends/60s):  looks like paste/quick reply. Fast, minimal typing delay.
+//	tier 1 (normal, 3-5 sends/60s):  brisk manual typing, still comfortably human.
+//	tier 2 (intense, 6+ sends/60s):  deliberately slower + extra pauses, avoids bulk-blast pattern.
+func speedTierFor(intensity int) int {
+	switch {
+	case intensity <= 2:
+		return 0
+	case intensity <= 5:
+		return 1
+	default:
+		return 2
+	}
+}
+
+// sendWithHumanPresence enforces a typing/presence pipeline whose speed adapts
+// to how intensely `session` has been sending in the last 60 seconds (see
+// speedTierFor). Casual/occasional sends go fast (like a copy-paste), bursts
+// get slowed down and given more jitter so they don't look automated.
+func sendWithHumanPresence(ctx context.Context, cli *whatsmeow.Client, jid types.JID, msg *proto.Message, textLen int, session string, replyMsgID ...types.MessageID) (whatsmeow.SendResponse, error) {
+	intensity := recordAndGetIntensity(session)
+	tier := speedTierFor(intensity)
+
 	// 1. Subscribe & Online Presence (Must subscribe to peer presence so WhatsApp server broadcasts typing status)
 	_ = cli.SubscribePresence(ctx, jid)
 	_ = cli.SendPresence(ctx, types.PresenceAvailable)
-	time.Sleep(time.Duration(300+rand.Intn(400)) * time.Millisecond)
+	switch tier {
+	case 0:
+		time.Sleep(time.Duration(80+rand.Intn(150)) * time.Millisecond)
+	case 1:
+		time.Sleep(time.Duration(200+rand.Intn(300)) * time.Millisecond)
+	default:
+		time.Sleep(time.Duration(350+rand.Intn(450)) * time.Millisecond)
+	}
 
 	// 2. Read Receipt (Mark message as read if reply ID provided or active chat)
 	if len(replyMsgID) > 0 && replyMsgID[0] != "" {
 		_ = cli.MarkRead(ctx, replyMsgID, time.Now(), jid, jid)
-		time.Sleep(time.Duration(400+rand.Intn(500)) * time.Millisecond)
+		if tier == 0 {
+			time.Sleep(time.Duration(150+rand.Intn(200)) * time.Millisecond)
+		} else {
+			time.Sleep(time.Duration(400+rand.Intn(500)) * time.Millisecond)
+		}
 	}
 
-	// 3. Calculate Realistic Human Typing Duration based on 30 WPM - 50 WPM:
-	// 50 WPM = 240ms/char (fastest human speed)
-	// 30 WPM = 400ms/char (relaxed human speed)
-	charMs := 240 + rand.Intn(120)
-	totalTypingMs := textLen * charMs
-	if totalTypingMs < 1500 { // minimum typing duration for very short text/media (1.5s - 2.2s)
-		totalTypingMs = 1500 + rand.Intn(700)
+	// 3. Calculate typing duration for this tier.
+	// tier 0 (casual): fast, like pasting a link/prepared text — real humans don't
+	//   "type" pasted content char by char, so this is a short flat duration, not
+	//   proportional to length.
+	// tier 1 (normal): brisk manual typing, ~65-100 WPM equivalent (120-185ms/char).
+	// tier 2 (intense): slower manual typing, ~30-50 WPM equivalent (240-400ms/char),
+	//   plus a longer floor, to visibly break up rapid-fire sends.
+	var charMs, totalTypingMs int
+	switch tier {
+	case 0:
+		totalTypingMs = 350 + rand.Intn(550) // ~0.35s-0.9s flat, paste-like
+	case 1:
+		charMs = 120 + rand.Intn(65)
+		totalTypingMs = textLen * charMs
+		if totalTypingMs < 900 {
+			totalTypingMs = 900 + rand.Intn(500)
+		}
+	default:
+		charMs = 240 + rand.Intn(160)
+		totalTypingMs = textLen * charMs
+		if totalTypingMs < 1800 {
+			totalTypingMs = 1800 + rand.Intn(900)
+		}
 	}
 
 	// 4. Interactive Typing Simulation: Keep "composing" status alive on WhatsApp servers
 	// Refresh ChatPresenceComposing every 1.5s so typing bubble never disappears/expires on recipient screen
-	log.Printf("TYPING SIMULATION: peer=%s %d chars @ ~%dms/char -> total duration %dms", jid.String(), textLen, charMs, totalTypingMs)
-	
+	log.Printf("TYPING SIMULATION: session=%s tier=%d intensity=%d/60s peer=%s %d chars -> total duration %dms", session, tier, intensity, jid.String(), textLen, totalTypingMs)
+
 	elapsed := 0
 	for elapsed < totalTypingMs {
 		if err := cli.SendChatPresence(ctx, jid, types.ChatPresenceComposing, types.ChatPresenceMediaText); err != nil {
 			log.Printf("SendChatPresence error for %s: %v", jid.String(), err)
 		}
-		
+
 		// Refresh every 1.5s (1500ms) to ensure continuous "typing..." bubble on receiver screen
 		chunk := 1500
 		if totalTypingMs-elapsed < chunk {
@@ -557,9 +633,15 @@ func sendWithHumanPresence(ctx context.Context, cli *whatsmeow.Client, jid types
 		elapsed += chunk
 	}
 
-	// 5. Brief pause before hit send (200ms-400ms) + Clear Composing State
+	// 5. Brief pause before hit send + Clear Composing State.
+	// Intense tier gets a longer, more variable pause — mimics a human re-reading
+	// before sending, and further staggers back-to-back bot-like sends.
 	_ = cli.SendChatPresence(ctx, jid, types.ChatPresencePaused, types.ChatPresenceMediaText)
-	time.Sleep(time.Duration(200+rand.Intn(200)) * time.Millisecond)
+	if tier == 2 {
+		time.Sleep(time.Duration(400+rand.Intn(500)) * time.Millisecond)
+	} else {
+		time.Sleep(time.Duration(120+rand.Intn(150)) * time.Millisecond)
+	}
 
 	// 6. Send the actual message
 	return cli.SendMessage(ctx, jid, msg)
@@ -602,7 +684,7 @@ func handleSend(w http.ResponseWriter, r *http.Request) {
 	if req.ReplyMsgID != "" {
 		replyIDs = append(replyIDs, types.MessageID(req.ReplyMsgID))
 	}
-	resp, err := sendWithHumanPresence(context.Background(), cli, jid, msg, len(req.Text), replyIDs...)
+	resp, err := sendWithHumanPresence(context.Background(), cli, jid, msg, len(req.Text), req.Session, replyIDs...)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"send: %s"}`, err.Error()), 500)
 		return
@@ -809,7 +891,7 @@ func handleSendMedia(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	sendResp, err := sendWithHumanPresence(ctx, cli, jid, msg, len(req.Caption))
+	sendResp, err := sendWithHumanPresence(ctx, cli, jid, msg, len(req.Caption), req.Session)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"send: %s"}`, err.Error()), 500)
 		return
@@ -879,7 +961,7 @@ func handleSendAsync(w http.ResponseWriter, r *http.Request) {
 		if req.ReplyMsgID != "" {
 			replyIDs = append(replyIDs, types.MessageID(req.ReplyMsgID))
 		}
-		resp, err := sendWithHumanPresence(context.Background(), cli, jid, msg, len(req.Text), replyIDs...)
+		resp, err := sendWithHumanPresence(context.Background(), cli, jid, msg, len(req.Text), req.Session, replyIDs...)
 		if err != nil {
 			log.Printf("send (async) %s->%s FAIL: %v", req.Session, jid.String(), err)
 			return
@@ -924,7 +1006,7 @@ func handleEdit(w http.ResponseWriter, r *http.Request) {
 	newMsg := &proto.Message{Conversation: &req.Text}
 	editMsg := cli.BuildEdit(jid, types.MessageID(req.MessageID), newMsg)
 
-	resp, err := sendWithHumanPresence(context.Background(), cli, jid, editMsg, len(req.Text))
+	resp, err := sendWithHumanPresence(context.Background(), cli, jid, editMsg, len(req.Text), req.Session)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"edit: %s"}`, err.Error()), 500)
 		return
@@ -966,7 +1048,7 @@ func handleRevoke(w http.ResponseWriter, r *http.Request) {
 	// But since this is a simple bot interface, we assume revoking our own messages for now
 	revokeMsg := cli.BuildRevoke(jid, types.EmptyJID, types.MessageID(req.MessageID))
 
-	resp, err := sendWithHumanPresence(context.Background(), cli, jid, revokeMsg, 0)
+	resp, err := sendWithHumanPresence(context.Background(), cli, jid, revokeMsg, 0, req.Session)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"revoke: %s"}`, err.Error()), 500)
 		return
@@ -1361,7 +1443,7 @@ func handlePing(w http.ResponseWriter, r *http.Request) {
 		msg := &proto.Message{Conversation: &text}
 
 		// Send message using mandatory 4-step human presence pipeline
-		_, err := sendWithHumanPresence(ctx, cli, pingGroup, msg, len(text))
+		_, err := sendWithHumanPresence(ctx, cli, pingGroup, msg, len(text), name)
 		if err != nil {
 			results = append(results, fmt.Sprintf("%s: FAIL (%s)", name, err.Error()))
 			log.Printf("PING [%s]: FAIL (%v)", name, err)
